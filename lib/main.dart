@@ -1,121 +1,304 @@
+import 'dart:typed_data';
+
+import 'package:camera/camera.dart';
+import 'package:file_saver/file_saver.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
-void main() {
-  runApp(const MyApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const CameraDemoApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class CameraDemoApp extends StatelessWidget {
+  const CameraDemoApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      title: 'Prueba de cámara',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
+      home: const CameraHomePage(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class CameraHomePage extends StatefulWidget {
+  const CameraHomePage({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<CameraHomePage> createState() => _CameraHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _CameraHomePageState extends State<CameraHomePage> {
+  CameraController? _controller;
+  List<CameraDescription> _cameras = [];
+  XFile? _capturedImage;
+  bool _initializing = true;
+  bool _takingPicture = false;
+  bool _saving = false;
+  String? _error;
 
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
-    });
+  @override
+  void initState() {
+    super.initState();
+    _initializeCamera();
+  }
+
+  Future<void> _initializeCamera({int? cameraIndex}) async {
+    if (mounted) {
+      setState(() {
+        _initializing = true;
+        _error = null;
+      });
+    }
+
+    try {
+      _cameras = await availableCameras();
+      if (_cameras.isEmpty) {
+        throw CameraException('no_camera', 'No se encontró ninguna cámara disponible.');
+      }
+
+      final selectedIndex = cameraIndex ?? _preferredCameraIndex();
+      final camera = _cameras[selectedIndex.clamp(0, _cameras.length - 1).toInt()];
+      final oldController = _controller;
+      _controller = CameraController(
+        camera,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.jpeg,
+      );
+      await oldController?.dispose();
+      await _controller!.initialize();
+    } on CameraException catch (e) {
+      _error = _cameraErrorMessage(e);
+    } catch (e) {
+      _error = 'No se pudo iniciar la cámara: $e';
+    } finally {
+      if (mounted) setState(() => _initializing = false);
+    }
+  }
+
+  int _preferredCameraIndex() {
+    final backIndex = _cameras.indexWhere(
+      (camera) => camera.lensDirection == CameraLensDirection.back,
+    );
+    return backIndex >= 0 ? backIndex : 0;
+  }
+
+  String _cameraErrorMessage(CameraException e) {
+    switch (e.code) {
+      case 'CameraAccessDenied':
+        return 'Permiso de cámara denegado. Autoriza el acceso en los ajustes del dispositivo o navegador.';
+      case 'CameraAccessDeniedWithoutPrompt':
+        return 'El navegador bloqueó la cámara. Revisa los permisos del sitio.';
+      case 'CameraAccessRestricted':
+        return 'El acceso a la cámara está restringido en este dispositivo.';
+      default:
+        return 'Error de cámara (${e.code}): ${e.description ?? 'sin detalle'}';
+    }
+  }
+
+  Future<void> _takePicture() async {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized || _takingPicture) return;
+
+    setState(() => _takingPicture = true);
+    try {
+      final image = await controller.takePicture();
+      if (mounted) setState(() => _capturedImage = image);
+    } on CameraException catch (e) {
+      _showMessage('No se pudo tomar la fotografía: ${e.description ?? e.code}');
+    } catch (e) {
+      _showMessage('Error al capturar la imagen: $e');
+    } finally {
+      if (mounted) setState(() => _takingPicture = false);
+    }
+  }
+
+  Future<void> _savePicture() async {
+    final image = _capturedImage;
+    if (image == null || _saving) return;
+
+    setState(() => _saving = true);
+    try {
+      final bytes = await image.readAsBytes();
+      final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-').split('.').first;
+      final filename = 'captura_$timestamp';
+
+      // FileSaver descarga el archivo en web y lo guarda/expone para guardar en dispositivos.
+      await FileSaver.instance.saveFile(
+        name: filename,
+        bytes: bytes,
+        ext: 'jpg',
+        mimeType: MimeType.jpeg,
+      );
+      _showMessage(kIsWeb
+          ? 'Se inició la descarga de la fotografía.'
+          : 'Fotografía enviada al sistema de guardado del dispositivo.');
+    } catch (e) {
+      _showMessage('No se pudo guardar la fotografía: $e');
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
+    final controller = _controller;
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
-          children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+        title: const Text('Prueba de cámara'),
+        actions: [
+          if (_cameras.length > 1)
+            IconButton(
+              tooltip: 'Cambiar cámara',
+              onPressed: _initializing
+                  ? null
+                  : () {
+                      final current = _cameras.indexOf(controller!.description);
+                      _initializeCamera(cameraIndex: (current + 1) % _cameras.length);
+                    },
+              icon: const Icon(Icons.cameraswitch),
             ),
-          ],
+        ],
+      ),
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 720),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  Expanded(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(16),
+                      child: Container(
+                        width: double.infinity,
+                        color: Colors.black12,
+                        child: _buildPreview(controller),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  if (_capturedImage != null) ...[
+                    Row(
+                      children: [
+                        const Icon(Icons.check_circle_outline, color: Colors.green),
+                        const SizedBox(width: 8),
+                        const Expanded(child: Text('Captura lista para guardar')),
+                        TextButton.icon(
+                          onPressed: () => setState(() => _capturedImage = null),
+                          icon: const Icon(Icons.refresh),
+                          label: const Text('Repetir'),
+                        ),
+                      ],
+                    ),
+                  ] else ...[
+                    const Text('Alinea la cámara y toma una fotografía.'),
+                    const SizedBox(height: 8),
+                  ],
+                  Row(
+                    children: [
+                      Expanded(
+                        child: FilledButton.icon(
+                          onPressed: _initializing || _takingPicture || controller?.value.isInitialized != true
+                              ? null
+                              : _takePicture,
+                          icon: _takingPicture
+                              ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Icon(Icons.camera_alt),
+                          label: Text(_takingPicture ? 'Capturando...' : 'Tomar foto'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _capturedImage == null || _saving ? null : _savePicture,
+                          icon: _saving
+                              ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Icon(Icons.save_alt),
+                          label: Text(_saving ? 'Guardando...' : 'Guardar captura'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    kIsWeb
+                        ? 'En web, la captura se descarga como archivo JPG.'
+                        : 'En móvil, el sistema permite guardar la captura en el dispositivo.',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+          ),
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
+    );
+  }
+
+  Widget _buildPreview(CameraController? controller) {
+    if (_initializing) return const Center(child: CircularProgressIndicator());
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.no_photography, size: 48),
+              const SizedBox(height: 12),
+              Text(_error!, textAlign: TextAlign.center),
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: _initializeCamera,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Reintentar'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    if (_capturedImage != null) {
+      return FutureBuilder<Uint8List>(
+        future: _capturedImage!.readAsBytes(),
+        builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return const Center(child: Text('No se pudo mostrar la captura.'));
+          }
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          return Image.memory(snapshot.data!, fit: BoxFit.contain);
+        },
+      );
+    }
+    if (controller == null || !controller.value.isInitialized) {
+      return const Center(child: Text('La cámara no está disponible.'));
+    }
+    return Center(
+      child: AspectRatio(
+        aspectRatio: controller.value.aspectRatio,
+        child: CameraPreview(controller),
       ),
     );
   }
